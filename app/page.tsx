@@ -29,6 +29,7 @@ import {
   GripVertical,
 } from "lucide-react"
 import { format } from "date-fns"
+import { openDB, DBSchema, IDBPDatabase } from 'idb'
 
 interface MediaItem {
   id: string
@@ -60,6 +61,28 @@ interface Entry {
   updatedAt: string
 }
 
+interface MediaDB extends DBSchema {
+  media: {
+    key: string;
+    value: {
+      id: string;
+      type: "image" | "video" | "audio";
+      url: string;
+      name: string;
+    };
+  };
+}
+
+interface EntryWithoutMedia {
+  id: string;
+  date: string;
+  title: string;
+  textBlocks: TextBlock[];
+  displayOrder: DisplayItem[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export default function PersonalLog() {
   const [selectedDate, setSelectedDate] = useState<Date>(new Date())
   const [entries, setEntries] = useState<Entry[]>([])
@@ -72,50 +95,90 @@ export default function PersonalLog() {
   const [showSearchResults, setShowSearchResults] = useState(false)
   const [draggedItem, setDraggedItem] = useState<string | null>(null)
   const [dragOverItem, setDragOverItem] = useState<string | null>(null)
+  const [db, setDb] = useState<IDBPDatabase<MediaDB> | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const { theme, setTheme } = useTheme()
 
+  // Initialize IndexedDB
+  useEffect(() => {
+    const initDB = async () => {
+      const database = await openDB<MediaDB>("personal-log-db", 1, {
+        upgrade(db) {
+          if (!db.objectStoreNames.contains("media")) {
+            db.createObjectStore("media", { keyPath: "id" });
+          }
+        },
+      });
+      setDb(database);
+    };
+    initDB();
+  }, []);
+
+  // Load entries from localStorage and IndexedDB on mount
+  useEffect(() => {
+    const loadData = async () => {
+      const savedEntries = localStorage.getItem("personal-log-entries")
+      if (savedEntries) {
+        const loadedEntries = JSON.parse(savedEntries)
+        const migratedEntries = await Promise.all(loadedEntries.map(async (entry: any) => {
+          // If entry has media, load it from IndexedDB
+          if (entry.media && entry.media.length > 0 && db) {
+            const mediaItems = await Promise.all(entry.media.map(async (media: MediaItem) => {
+              try {
+                const storedMedia = await db.get("media", media.id);
+                return storedMedia || media;
+              } catch (error) {
+                console.error("Error loading media:", error);
+                return media;
+              }
+            }));
+            return { ...entry, media: mediaItems };
+          }
+          return entry;
+        }));
+        setEntries(migratedEntries);
+      }
+    };
+    if (db) {
+      loadData();
+    }
+  }, [db]);
+
+  // Save entries to localStorage and IndexedDB whenever entries change
+  useEffect(() => {
+    const saveData = async () => {
+      if (!db) return;
+
+      // Save media to IndexedDB and create a stripped version of entries for localStorage
+      const entriesWithoutMedia = await Promise.all(entries.map(async (entry) => {
+        // Save each media item to IndexedDB
+        await Promise.all(entry.media.map(async (media) => {
+          try {
+            await db.put("media", media);
+          } catch (error) {
+            console.error("Error saving media:", error);
+          }
+        }));
+
+        // Return entry without media array for localStorage
+        const { media, ...entryWithoutMedia } = entry;
+        return {
+          ...entryWithoutMedia,
+          media: media.map(({ id, type, name }) => ({ id, type, name }))
+        };
+      }));
+
+      // Save stripped entries to localStorage
+      localStorage.setItem("personal-log-entries", JSON.stringify(entriesWithoutMedia));
+    };
+
+    if (db) {
+      saveData();
+    }
+  }, [entries, db]);
+
   // Check if the selected date allows editing (today or past)
   const canEdit = selectedDate <= new Date()
-
-  // Load entries from localStorage on mount
-  useEffect(() => {
-    const savedEntries = localStorage.getItem("personal-log-entries")
-    if (savedEntries) {
-      const loadedEntries = JSON.parse(savedEntries)
-      const migratedEntries = loadedEntries.map((entry: any) => {
-        // If entry has paragraphs, keep as is
-        if (entry.paragraphs) return entry
-        // If entry has text, split into paragraphs
-        if (entry.text) {
-          const now = entry.createdAt || new Date().toISOString()
-          const paragraphs = entry.text
-            .split(/\n\n+/)
-            .filter((p: string) => p.trim() !== "")
-            .map((p: string) => ({
-              id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
-              text: p,
-              timestamp: now,
-            }))
-          return {
-            ...entry,
-            paragraphs,
-            displayOrder: [
-              ...paragraphs.map((para: any) => ({ id: `display-${para.id}`, type: "text", itemId: para.id })),
-              ...(entry.displayOrder?.filter((item: any) => item.type === "media") || []),
-            ],
-          }
-        }
-        return entry
-      })
-      setEntries(migratedEntries)
-    }
-  }, [])
-
-  // Save entries to localStorage whenever entries change
-  useEffect(() => {
-    localStorage.setItem("personal-log-entries", JSON.stringify(entries))
-  }, [entries])
 
   // Load entry for selected date
   useEffect(() => {
@@ -407,41 +470,69 @@ export default function PersonalLog() {
           )}
 
           {media.type === "image" && (
-            <Dialog>
-              <DialogTrigger asChild>
-                <div className="cursor-pointer">
-                  <img
-                    src={media.url || "/placeholder.svg"}
-                    alt={media.name}
-                    className="w-full max-w-2xl h-64 object-contain rounded-lg hover:opacity-90 transition-opacity"
-                  />
-                </div>
-              </DialogTrigger>
-              <DialogContent className="max-w-[95vw] max-h-[95vh] w-auto h-auto p-2 bg-black/95 border-none">
-                <div className="flex items-center justify-center w-full h-full">
-                  <img
-                    src={media.url || "/placeholder.svg"}
-                    alt={media.name}
-                    className="max-w-full max-h-full object-contain"
-                    style={{ maxWidth: "90vw", maxHeight: "90vh" }}
-                  />
-                </div>
-              </DialogContent>
-            </Dialog>
+            <div className="my-8">
+              <Dialog>
+                <DialogTrigger asChild>
+                  <div className="cursor-pointer group/image">
+                    <div className="relative overflow-hidden rounded-xl shadow-lg hover:shadow-xl transition-all duration-300 transform hover:scale-[1.02]">
+                      <img
+                        src={media.url || "/placeholder.svg"}
+                        alt={media.name}
+                        className="w-full max-w-3xl mx-auto object-cover aspect-video bg-gradient-to-br from-slate-100 to-slate-200 dark:from-slate-800 dark:to-slate-900"
+                        style={{ minHeight: '300px', maxHeight: '500px' }}
+                      />
+                      <div className="absolute inset-0 bg-black/0 group-hover/image:bg-black/10 transition-colors duration-300" />
+                      <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/60 to-transparent p-4 opacity-0 group-hover/image:opacity-100 transition-opacity duration-300">
+                        <p className="text-white text-sm font-medium truncate">{media.name}</p>
+                      </div>
+                    </div>
+                  </div>
+                </DialogTrigger>
+                <DialogContent className="max-w-[95vw] max-h-[95vh] w-auto h-auto p-2 bg-black/95 border-none">
+                  <div className="flex items-center justify-center w-full h-full">
+                    <img
+                      src={media.url || "/placeholder.svg"}
+                      alt={media.name}
+                      className="max-w-full max-h-full object-contain"
+                      style={{ maxWidth: "90vw", maxHeight: "90vh" }}
+                    />
+                  </div>
+                </DialogContent>
+              </Dialog>
+            </div>
           )}
           {media.type === "video" && (
-            <video src={media.url} controls className="w-full max-w-2xl h-64 object-contain rounded-lg" />
+            <div className="my-8">
+              <div className="relative overflow-hidden rounded-xl shadow-lg">
+                <video 
+                  src={media.url} 
+                  controls 
+                  className="w-full max-w-3xl mx-auto object-cover aspect-video bg-gradient-to-br from-slate-100 to-slate-200 dark:from-slate-800 dark:to-slate-900"
+                  style={{ minHeight: '300px', maxHeight: '500px' }}
+                />
+                <div className="absolute top-4 left-4 bg-black/70 text-white px-2 py-1 rounded text-xs font-medium">
+                  {media.name}
+                </div>
+              </div>
+            </div>
           )}
           {media.type === "audio" && (
-            <Card className="overflow-hidden border-slate-200 dark:border-slate-700">
-              <CardContent className="p-4">
-                <div className="flex items-center gap-3 mb-2">
-                  <Music className="w-5 h-5 text-slate-500" />
-                  <span className="text-sm font-medium">{media.name}</span>
-                </div>
-                <audio src={media.url} controls className="w-full" />
-              </CardContent>
-            </Card>
+            <div className="my-6">
+              <Card className="overflow-hidden border-slate-200 dark:border-slate-700 shadow-lg hover:shadow-xl transition-shadow duration-300">
+                <CardContent className="p-6">
+                  <div className="flex items-center gap-4 mb-4">
+                    <div className="p-3 bg-slate-100 dark:bg-slate-800 rounded-lg">
+                      <Music className="w-6 h-6 text-slate-600 dark:text-slate-400" />
+                    </div>
+                    <div className="flex-1">
+                      <h4 className="font-medium text-slate-900 dark:text-slate-100 mb-1">{media.name}</h4>
+                      <p className="text-sm text-slate-500 dark:text-slate-400">Audio file</p>
+                    </div>
+                  </div>
+                  <audio src={media.url} controls className="w-full" />
+                </CardContent>
+              </Card>
+            </div>
           )}
         </div>
       )
@@ -524,14 +615,17 @@ export default function PersonalLog() {
               }}
               modifiersStyles={{
                 hasEntry: {
-                  backgroundColor: "hsl(var(--primary))",
-                  color: "hsl(var(--primary-foreground))",
                   fontWeight: "600",
+                  border: "2px solid hsl(var(--primary))",
                 },
                 future: {
                   opacity: 0.4,
                   textDecoration: "line-through",
                 },
+              }}
+              classNames={{
+                day_selected: "!bg-blue-600 !text-white !font-semibold hover:!bg-blue-700 focus:!bg-blue-700",
+                day: "h-9 w-9 p-0 font-normal aria-selected:opacity-100 relative",
               }}
             />
           </div>
