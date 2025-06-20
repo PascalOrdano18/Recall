@@ -29,7 +29,6 @@ import {
   GripVertical,
 } from "lucide-react"
 import { format } from "date-fns"
-import { openDB, DBSchema, IDBPDatabase } from 'idb'
 
 interface MediaItem {
   id: string
@@ -61,28 +60,6 @@ interface Entry {
   updatedAt: string
 }
 
-interface MediaDB extends DBSchema {
-  media: {
-    key: string;
-    value: {
-      id: string;
-      type: "image" | "video" | "audio";
-      url: string;
-      name: string;
-    };
-  };
-}
-
-interface EntryWithoutMedia {
-  id: string;
-  date: string;
-  title: string;
-  textBlocks: TextBlock[];
-  displayOrder: DisplayItem[];
-  createdAt: string;
-  updatedAt: string;
-}
-
 export default function PersonalLog() {
   const [selectedDate, setSelectedDate] = useState<Date>(new Date())
   const [entries, setEntries] = useState<Entry[]>([])
@@ -95,87 +72,39 @@ export default function PersonalLog() {
   const [showSearchResults, setShowSearchResults] = useState(false)
   const [draggedItem, setDraggedItem] = useState<string | null>(null)
   const [dragOverItem, setDragOverItem] = useState<string | null>(null)
-  const [db, setDb] = useState<IDBPDatabase<MediaDB> | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const { theme, setTheme } = useTheme()
 
-  // Initialize IndexedDB
+  // Load entries from backend API on mount
   useEffect(() => {
-    const initDB = async () => {
-      const database = await openDB<MediaDB>("personal-log-db", 1, {
-        upgrade(db) {
-          if (!db.objectStoreNames.contains("media")) {
-            db.createObjectStore("media", { keyPath: "id" });
-          }
-        },
-      });
-      setDb(database);
-    };
-    initDB();
-  }, []);
-
-  // Load entries from localStorage and IndexedDB on mount
-  useEffect(() => {
-    const loadData = async () => {
-      const savedEntries = localStorage.getItem("personal-log-entries")
-      if (savedEntries) {
-        const loadedEntries = JSON.parse(savedEntries)
-        const migratedEntries = await Promise.all(loadedEntries.map(async (entry: any) => {
-          // If entry has media, load it from IndexedDB
-          if (entry.media && entry.media.length > 0 && db) {
-            const mediaItems = await Promise.all(entry.media.map(async (media: MediaItem) => {
-              try {
-                const storedMedia = await db.get("media", media.id);
-                return storedMedia || media;
-              } catch (error) {
-                console.error("Error loading media:", error);
-                return media;
-              }
-            }));
-            return { ...entry, media: mediaItems };
-          }
-          return entry;
-        }));
-        setEntries(migratedEntries);
+    const loadEntries = async () => {
+      try {
+        const res = await fetch('/api/entries')
+        if (res.ok) {
+          setEntries(await res.json())
+        }
+      } catch (error) {
+        console.error('Error loading entries:', error)
       }
-    };
-    if (db) {
-      loadData();
     }
-  }, [db]);
+    loadEntries()
+  }, [])
 
-  // Save entries to localStorage and IndexedDB whenever entries change
+  // Save entries to backend API whenever entries change
   useEffect(() => {
-    const saveData = async () => {
-      if (!db) return;
-
-      // Save media to IndexedDB and create a stripped version of entries for localStorage
-      const entriesWithoutMedia = await Promise.all(entries.map(async (entry) => {
-        // Save each media item to IndexedDB
-        await Promise.all(entry.media.map(async (media) => {
-          try {
-            await db.put("media", media);
-          } catch (error) {
-            console.error("Error saving media:", error);
-          }
-        }));
-
-        // Return entry without media array for localStorage
-        const { media, ...entryWithoutMedia } = entry;
-        return {
-          ...entryWithoutMedia,
-          media: media.map(({ id, type, name }) => ({ id, type, name }))
-        };
-      }));
-
-      // Save stripped entries to localStorage
-      localStorage.setItem("personal-log-entries", JSON.stringify(entriesWithoutMedia));
-    };
-
-    if (db) {
-      saveData();
+    const saveEntries = async () => {
+      try {
+        await fetch('/api/entries', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(entries)
+        })
+      } catch (error) {
+        console.error('Error saving entries:', error)
+      }
     }
-  }, [entries, db]);
+    if (entries.length > 0) saveEntries()
+  }, [entries])
 
   // Check if the selected date allows editing (today or past)
   const canEdit = selectedDate <= new Date()
@@ -211,31 +140,34 @@ export default function PersonalLog() {
     const newDisplayItems: DisplayItem[] = []
 
     for (const file of Array.from(files)) {
-      // Convert file to Base64
-      const base64Url = await new Promise<string>((resolve) => {
-        const reader = new FileReader()
-        reader.onloadend = () => resolve(reader.result as string)
-        reader.readAsDataURL(file)
-      })
-
-      const type = file.type.startsWith("image/") ? "image" : file.type.startsWith("video/") ? "video" : "audio"
-      const mediaId = Date.now().toString() + Math.random().toString(36).substr(2, 9)
-
-      newMediaItems.push({
-        id: mediaId,
-        type: type as "image" | "video" | "audio",
-        url: base64Url,
-        name: file.name,
-      })
-
-      newDisplayItems.push({
-        id: `display-${mediaId}`,
-        type: "media",
-        itemId: mediaId,
-      })
+      const formData = new FormData()
+      formData.append('file', file)
+      try {
+        const res = await fetch('/api/media', {
+          method: 'POST',
+          body: formData
+        })
+        if (!res.ok) throw new Error('Failed to upload file')
+        const data = await res.json()
+        const mediaId = data.id
+        const type = file.type.startsWith('image/') ? 'image' : file.type.startsWith('video/') ? 'video' : 'audio'
+        newMediaItems.push({
+          id: mediaId,
+          type,
+          url: data.url,
+          name: file.name
+        })
+        newDisplayItems.push({
+          id: `display-${mediaId}`,
+          type: 'media',
+          itemId: mediaId
+        })
+      } catch (error) {
+        console.error('Error uploading file:', error)
+      }
     }
 
-    const dateStr = format(selectedDate, "yyyy-MM-dd")
+    const dateStr = format(selectedDate, 'yyyy-MM-dd')
     const now = new Date().toISOString()
 
     if (currentEntry) {
@@ -244,27 +176,25 @@ export default function PersonalLog() {
         title: title,
         media: [...currentEntry.media, ...newMediaItems],
         displayOrder: [...currentEntry.displayOrder, ...newDisplayItems],
-        updatedAt: now,
+        updatedAt: now
       }
       setCurrentEntry(updatedEntry)
-      setEntries((prev) => prev.map((e) => (e.id === currentEntry.id ? updatedEntry : e)))
+      setEntries(prev => prev.map(e => e.id === currentEntry.id ? updatedEntry : e))
     } else {
       const newEntry: Entry = {
         id: Date.now().toString(),
         date: dateStr,
-        title: title || "",
+        title: title || '',
         textBlocks: [],
         media: newMediaItems,
-        displayOrder: [
-          ...newDisplayItems,
-        ],
+        displayOrder: [...newDisplayItems],
         createdAt: now,
-        updatedAt: now,
+        updatedAt: now
       }
       setCurrentEntry(newEntry)
-      setEntries((prev) => [...prev, newEntry])
+      setEntries(prev => [...prev, newEntry])
     }
-    event.target.value = ""
+    event.target.value = ''
     setIsEditing(true)
   }
 
